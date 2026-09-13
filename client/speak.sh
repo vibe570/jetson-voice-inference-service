@@ -107,6 +107,12 @@ sys.stdout.write("\n".join(out) + "\n")
 }
 
 # ---------- 主流程 ----------
+# 本地播放器环境自举: 首次运行自动创建 venv 并安装 sounddevice
+if [ ! -x "$SRC_DIR/.venv/bin/python" ]; then
+    echo ">> 首次运行：创建本地播放器环境（venv + sounddevice，约 1 分钟）..."
+    python3 -m venv "$SRC_DIR/.venv" && "$SRC_DIR/.venv/bin/pip" install -q sounddevice || \
+        echo ">> 播放器环境创建失败，将回退到 ffplay"
+fi
 # 播放器可用性检查：sounddevice 播放器或 ffplay 二者有其一即可
 if [ ! -x "$SRC_DIR/.venv/bin/python" ] || [ ! -f "$SRC_DIR/client/speak_player.py" ]; then
     if ! command -v ffplay >/dev/null 2>&1; then
