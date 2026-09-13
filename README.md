@@ -19,6 +19,22 @@ Mac(client)                                Jetson(sky.local)
 └─────────────────────────┘                 └──────────────────────────────┘
 ```
 
+## 结构
+
+```
+client/                  # Mac 端（局域网客户端）
+  speak.sh               入口：引擎/音色切换、md 清洗、自动保存 wav
+  speak_player.py        sounddevice 流式播放器
+jetson/                  # Jetson 端（推理服务）
+  clone_stream.py        参考音频克隆，伪流式（分段整段合成+双缓冲流水线）
+  piper_stream.py        Piper 万字段落流式合成
+  setup_jet.sh           一键环境初始化（venv + piper + 中文语音模型）
+  sovits/                GPT-SoVITS 服务部署文件（当前在跑的版本）
+    api_v2.py            API 服务源码（流式/非流式接口）
+    tts_infer.yaml       模型配置（默认节: v2ProPlus + zizi1 微调权重）
+speak.sh                 → client/speak.sh 软链（仓库根入口）
+```
+
 ## 部署
 
 ### Jetson 端(一次性)
@@ -28,6 +44,12 @@ Mac(client)                                Jetson(sky.local)
 1. **部署 GPT-SoVITS 服务**(如果还没部署):
 
    ```bash
+   # 安装完整的 GPT-SoVITS 环境后，把本仓库 jetson/sovits/ 下的部署文件放回对应位置：
+   cp jetson/sovits/api_v2.py ~/GPT-SoVITS/
+   cp jetson/sovits/tts_infer.yaml ~/GPT-SoVITS/GPT_SoVITS/configs/
+   # 权重按 tts_infer.yaml 默认节放置（本项目用 v2ProPlus + zizi1 微调权重，约 320MB，不随仓库分发）：
+   #   ~/GPT-SoVITS/GPT_weights_v2ProPlus/zizi1-e15.ckpt
+   #   ~/GPT-SoVITS/SoVITS_weights_v2ProPlus/zizi1_e8_s816.pth
    cd ~/GPT-SoVITS
    ~/sovits-venv/bin/python api_v2.py -a None -p 9880 -c GPT_SoVITS/configs/tts_infer.yaml
    ```
