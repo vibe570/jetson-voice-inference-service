@@ -161,6 +161,15 @@ case "${1:-}" in
         ;;
 esac
 
+# ---- 实时播放开关：--no-play 只推理+保存，不启动播放器 ----
+NO_PLAY=0
+case "${1:-}" in
+    --no-play|-q|--quiet)
+        NO_PLAY=1
+        shift
+        ;;
+esac
+
 echo ">> 同步脚本到 Jetson ..."
 run_ssh "mkdir -p ~/jetson-tts/voices"
 run_scp "$SRC_DIR/jetson/piper_stream.py" "$SRC_DIR/jetson/clone_stream.py" "$HOST:~/jetson-tts/"
@@ -231,33 +240,45 @@ OUT_WAV="$OUT_DIR/$(date +%Y%m%d-%H%M%S)-$$.wav"
 OUT_PCM="${OUT_WAV%.wav}.pcm"
 echo ">> 录音将保存到: $OUT_WAV"
 
-# 后台 watcher：远端推理一完成（out.done 出现）就立刻拉回 wav，不用等播放结束
+# 后台 watcher（仅克隆模式）：远端推理一完成（out.done 出现）就立刻拉回 wav，不用等播放结束
 run_ssh "rm -f ~/jetson-tts/out.done ~/jetson-tts/out.wav ~/jetson-tts/out.pcm" || true
-(
-    for _ in $(seq 1 1080); do   # 每 10s 检查一次，最多 3 小时
-        ssh -n "${SSH_OPTS[@]}" "$HOST" 'test -f ~/jetson-tts/out.done' 2>/dev/null && break
-        sleep 10
-    done
-    if scp "${SSH_OPTS[@]}" "$HOST:jetson-tts/out.wav" "$OUT_WAV" </dev/null 2>/dev/null; then
-        echo ">> 音频已生成并保存（推理完成即回传）: $OUT_WAV"
-    fi
-) &
-WATCH_PID=$!
-
-# 播放器：优先 sounddevice 回调播放器（按到达顺序播，不丢开头）；缺失时回退 ffplay
-PLAYER_PY="$SRC_DIR/.venv/bin/python"
-if [ -x "$PLAYER_PY" ] && [ -f "$SRC_DIR/client/speak_player.py" ]; then
-    ssh "${SSH_OPTS[@]}" "$HOST" "exec ~/jetson-tts/.venv/bin/python ~/jetson-tts/$REMOTE_SCRIPT" \
-        < "$INPUT_REDIR" \
-    | "$PLAYER_PY" "$SRC_DIR/client/speak_player.py" "$SAMPLE_RATE"
-else
-    ssh "${SSH_OPTS[@]}" "$HOST" "exec ~/jetson-tts/.venv/bin/python ~/jetson-tts/$REMOTE_SCRIPT" \
-        < "$INPUT_REDIR" \
-    | ffplay -loglevel error -nodisp -autoexit -fflags nobuffer \
-        -f s16le -ar "$SAMPLE_RATE" "${CH_OPT[@]}" -i pipe:0
+WATCH_PID=""
+if [ "$ENGINE" = clone ]; then
+    (
+        for _ in $(seq 1 1080); do   # 每 10s 检查一次，最多 3 小时
+            ssh -n "${SSH_OPTS[@]}" "$HOST" 'test -f ~/jetson-tts/out.done' 2>/dev/null && break
+            sleep 10
+        done
+        if scp "${SSH_OPTS[@]}" "$HOST:jetson-tts/out.wav" "$OUT_WAV" </dev/null 2>/dev/null; then
+            echo ">> 音频已生成并保存（推理完成即回传）: $OUT_WAV"
+        fi
+    ) &
+    WATCH_PID=$!
 fi
 
-wait "$WATCH_PID" 2>/dev/null || true
+if [ "$NO_PLAY" = 1 ]; then
+    echo ">> 已关闭实时播放：仅推理并保存音频（合成完成后 wav 即回传）..."
+    ssh "${SSH_OPTS[@]}" "$HOST" "exec ~/jetson-tts/.venv/bin/python ~/jetson-tts/$REMOTE_SCRIPT" \
+        < "$INPUT_REDIR" > /dev/null
+else
+    # 播放器：优先 sounddevice 回调播放器（按到达顺序播，不丢开头）；缺失时回退 ffplay
+    PLAYER_PY="$SRC_DIR/.venv/bin/python"
+    if [ -x "$PLAYER_PY" ] && [ -f "$SRC_DIR/client/speak_player.py" ]; then
+        ssh "${SSH_OPTS[@]}" "$HOST" "exec ~/jetson-tts/.venv/bin/python ~/jetson-tts/$REMOTE_SCRIPT" \
+            < "$INPUT_REDIR" \
+        | "$PLAYER_PY" "$SRC_DIR/client/speak_player.py" "$SAMPLE_RATE"
+    else
+        ssh "${SSH_OPTS[@]}" "$HOST" "exec ~/jetson-tts/.venv/bin/python ~/jetson-tts/$REMOTE_SCRIPT" \
+            < "$INPUT_REDIR" \
+        | ffplay -loglevel error -nodisp -autoexit -fflags nobuffer \
+            -f s16le -ar "$SAMPLE_RATE" "${CH_OPT[@]}" -i pipe:0
+    fi
+fi
+
+if [ -n "$WATCH_PID" ]; then
+    kill "$WATCH_PID" 2>/dev/null || true
+    wait "$WATCH_PID" 2>/dev/null || true
+fi
 
 # 收尾：正常完成时 wav 已由 watcher 拉回；中断时用远端 PCM 兜底转 wav
 if [ ! -f "$OUT_WAV" ]; then
