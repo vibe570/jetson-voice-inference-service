@@ -10,3 +10,5 @@ __pycache__/
 ref_test.*
 test_*.txt
 .DS_Store
+# bundled reference voice for the clone feature
+!jetson/sovits/ref_audio/reference.wav
