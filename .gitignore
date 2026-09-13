@@ -1,0 +1,12 @@
+# 本机产物与缓存
+voice/
+.venv/
+__pycache__/
+*.pyc
+*.wav
+*.pcm
+*.mp3
+*.ogg
+ref_test.*
+test_*.txt
+.DS_Store
