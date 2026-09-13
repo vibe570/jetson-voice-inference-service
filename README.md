@@ -36,6 +36,9 @@ jetson/                  # Jetson side (inference)
     api_v2.py              API service source (the running version)
     tts_infer.yaml         config (default section: v2ProPlus + self-trained weights)
     tts_infer.vanilla.yaml config (official pretrained v2ProPlus + CUDA, no extra weights)
+    GPT_weights_v2ProPlus/     self-trained GPT weights (Git LFS, in-repo)
+    SoVITS_weights_v2ProPlus/  self-trained SoVITS weights (Git LFS, in-repo)
+    ref_audio/             the bundled reference voice (reference.wav + matching text)
 speak.sh                 symlink → client/speak.sh (repo-root entry point)
 ```
 
@@ -72,7 +75,23 @@ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9880/   # 404 = server i
 ```
 
 > - The service does not auto-start after a reboot, but `speak.sh` detects this and starts it automatically (waiting 1–2 minutes for model load).
-> - If you have self-trained weights: place the ckpt/pth files and use `tts_infer.yaml`; otherwise the vanilla pretrained config is used and the voice follows the reference audio.
+> - No self-trained weights? Use the vanilla pretrained config; the voice then follows the reference audio completely.
+
+#### Bundled voice (included in this repo)
+
+The self-trained weights (`zizi1` fine-tuned) and the matching reference voice are committed via **Git LFS**. Run `git lfs install` once before cloning so they are pulled automatically.
+
+```bash
+# after step 1.2, place the weights exactly where tts_infer.yaml expects them (relative to ~/GPT-SoVITS):
+cp -r ~/jetson-voice-inference-service/jetson/sovits/GPT_weights_v2ProPlus ~/GPT-SoVITS/
+cp -r ~/jetson-voice-inference-service/jetson/sovits/SoVITS_weights_v2ProPlus ~/GPT-SoVITS/
+
+# restart the service, then activate the bundled voice from your Mac in one command:
+cd ~/GPT-SoVITS && nohup ./sovits-venv/bin/python api_v2.py -a None -p 9880 \
+    -c GPT_SoVITS/configs/tts_infer.yaml >> api.log 2>&1 &
+# (on the Mac)
+./speak.sh --set-ref jetson/sovits/ref_audio/reference.wav "$(cat jetson/sovits/ref_audio/reference.txt)"
+```
 
 ### 1.3 zram memory protection (strongly recommended)
 

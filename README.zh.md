@@ -72,7 +72,23 @@ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9880/   # 输出 404 = �
 ```
 
 > - 服务重启后不会自启,但 speak.sh 每次运行会自动检测并拉起(等待加载约 1~2 分钟)
-> - 有自训练权重:放入对应目录后改用 `tts_infer.yaml`;没有则用 vanilla 预训练配置,音色完全跟随参考音频
+> - 没有自训练权重?用 vanilla 预训练配置,音色完全跟随参考音频
+
+#### 内置音色(权重与参考音频已在仓库中)
+
+自训练权重(`zizi1` 微调)与配套参考音频通过 **Git LFS** 随仓库分发。clone 前执行一次 `git lfs install`,clone 时自动拉取。
+
+```bash
+# 完成 1.2 后,把权重放到 tts_infer.yaml 期望的位置(相对 ~/GPT-SoVITS):
+cp -r ~/jetson-voice-inference-service/jetson/sovits/GPT_weights_v2ProPlus ~/GPT-SoVITS/
+cp -r ~/jetson-voice-inference-service/jetson/sovits/SoVITS_weights_v2ProPlus ~/GPT-SoVITS/
+
+# 重启服务后,在 Mac 上一键启用内置参考音色:
+cd ~/GPT-SoVITS && nohup ./sovits-venv/bin/python api_v2.py -a None -p 9880 \
+    -c GPT_SoVITS/configs/tts_infer.yaml >> api.log 2>&1 &
+# (Mac 上执行)
+./speak.sh --set-ref jetson/sovits/ref_audio/reference.wav "$(cat jetson/sovits/ref_audio/reference.txt)"
+```
 
 ### 1.3 zram 内存保护(强烈建议)
 
