@@ -137,6 +137,7 @@ def main() -> None:
 
     # 双缓冲流水线：合成线程逐段合成入队；单段失败重试后跳过，绝不中断后续段落
     q: "queue.Queue" = queue.Queue(maxsize=PREBUFFER + 2)
+    tts_end_holder = {"t": None}  # 最后一段合成请求返回的时刻（TTS Compute 截止点）
 
     def producer():
         for i, ch in enumerate(chunks):
@@ -162,6 +163,7 @@ def main() -> None:
                     q.put((i, last_pcm, last_dur, time.time() - t1, f"[注意] {last_err}"))
                 else:
                     q.put((i, b"", 0.0, 0.0, f"合成失败，已跳过: {ch[:20]}…"))
+        tts_end_holder["t"] = time.time()  # 所有段合成请求均已返回（含跳过/重试）
         q.put(None)
 
     threading.Thread(target=producer, daemon=True).start()
@@ -218,7 +220,13 @@ def main() -> None:
         dump_f.close()
         sys.exit(0)
 
-    log(f"[done] 音频总时长 {total_audio:.1f}s，Jetson 总耗时 {time.time()-t_start:.1f}s")
+    wall_time = time.time() - t_start
+    compute_time = (tts_end_holder["t"] or time.time()) - t_start
+    log(
+        f"[done] 音频总时长(播放) {total_audio:.1f}s | "
+        f"TTS合成耗时(compute) {compute_time:.1f}s | "
+        f"流程总耗时(wall) {wall_time:.1f}s"
+    )
     dump_f.flush()
     dump_f.close()
     sys.stdout.buffer.flush()
