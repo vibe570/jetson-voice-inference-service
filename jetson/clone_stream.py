@@ -78,7 +78,7 @@ def split_text(text: str, max_chunk: int = MAX_CHUNK):
 
 
 def synth_one(text: str, ref_wav: str, prompt_text: str):
-    """一次非流式整段合成，返回 (pcm_bytes, 音频时长秒)。"""
+    """一次非流式整段合成，返回 (pcm_bytes, 音频时长秒, 本次网络请求耗时秒)。"""
     payload = {
         "text": text,
         "text_lang": "zh",
@@ -97,6 +97,7 @@ def synth_one(text: str, ref_wav: str, prompt_text: str):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    t0 = time.time()  # 精确计时：urlopen 到 read 完成（纯推理+网络往返）
     try:
         resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
     except urllib.error.HTTPError as e:
@@ -110,10 +111,11 @@ def synth_one(text: str, ref_wav: str, prompt_text: str):
         raise RuntimeError(f"无法连接服务 {API_BASE}: {e.reason}") from None
 
     body = resp.read()
+    req_time = time.time() - t0
     if len(body) < 44 or body[:4] != b"RIFF":
         raise RuntimeError("响应不是完整 wav")
     pcm = body[44:]
-    return pcm, len(pcm) / 2 / SAMPLE_RATE
+    return pcm, len(pcm) / 2 / SAMPLE_RATE, req_time
 
 
 def main() -> None:
@@ -137,19 +139,20 @@ def main() -> None:
 
     # 双缓冲流水线：合成线程逐段合成入队；单段失败重试后跳过，绝不中断后续段落
     q: "queue.Queue" = queue.Queue(maxsize=PREBUFFER + 2)
-    tts_end_holder = {"t": None}  # 最后一段合成请求返回的时刻（TTS Compute 截止点）
+    compute_holder = {"total": 0.0, "requests": 0}  # 纯推理耗时 = 每次网络请求耗时累加
 
     def producer():
         for i, ch in enumerate(chunks):
-            t1 = time.time()
-            last_pcm = last_dur = None
+            last_pcm = last_dur = last_dt = None
             last_err = ""
             for attempt in range(RETRY + 1):
                 try:
-                    pcm, dur = synth_one(ch, REF_WAV, prompt_text)
-                    last_pcm, last_dur = pcm, dur
+                    pcm, dur, dt = synth_one(ch, REF_WAV, prompt_text)
+                    compute_holder["total"] += dt
+                    compute_holder["requests"] += 1
+                    last_pcm, last_dur, last_dt = pcm, dur, dt
                     if dur >= len(ch) / FASTEST:
-                        q.put((i, pcm, dur, time.time() - t1, ""))
+                        q.put((i, pcm, dur, dt, ""))
                         break
                     last_err = f"疑似偏快({dur:.1f}s/{len(ch)}字)"
                     log(f"[warn] 第{i+1}段 {last_err}，重试 {attempt+1}/{RETRY}")
@@ -160,10 +163,9 @@ def main() -> None:
             else:
                 # 重试耗尽：拿到过音频就照播（偏快只是警告，绝不丢段）；彻底失败才跳过
                 if last_pcm:
-                    q.put((i, last_pcm, last_dur, time.time() - t1, f"[注意] {last_err}"))
+                    q.put((i, last_pcm, last_dur, last_dt, f"[注意] {last_err}"))
                 else:
                     q.put((i, b"", 0.0, 0.0, f"合成失败，已跳过: {ch[:20]}…"))
-        tts_end_holder["t"] = time.time()  # 所有段合成请求均已返回（含跳过/重试）
         q.put(None)
 
     threading.Thread(target=producer, daemon=True).start()
@@ -221,10 +223,10 @@ def main() -> None:
         sys.exit(0)
 
     wall_time = time.time() - t_start
-    compute_time = (tts_end_holder["t"] or time.time()) - t_start
     log(
         f"[done] 音频总时长(播放) {total_audio:.1f}s | "
-        f"TTS合成耗时(compute) {compute_time:.1f}s | "
+        f"TTS合成耗时(compute) {compute_holder['total']:.1f}s "
+        f"({compute_holder['requests']}次请求) | "
         f"流程总耗时(wall) {wall_time:.1f}s"
     )
     dump_f.flush()
