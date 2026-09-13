@@ -4,8 +4,10 @@
 Jetson 端：GPT-SoVITS 分段合成 + 连续流式输出（"伪流式"）
 - 服务端 streaming_mode 输出有杂音（整段合成正常），故放弃服务端流式
 - 长文按句切段，每段一次独立的非流式整段合成（质量稳定）
-- 双缓冲流水线：预合成 2 段后开始输出，边播边合成后续段，段间加 200ms 静音垫
-- 单段失败（接口错误/音频异常短）重试后跳过继续，绝不让一段失败吞掉剩余文本
+- 合成线程与播放完全解耦：合成线程全速推理并直接落盘 out.pcm；
+  主线程从磁盘缓冲追读、以任何速度写 stdout（不受合成速率影响）
+- 全部合成完成的瞬间就在 Jetson 端生成 out.wav 并写 out.done 标记，
+  Mac 端 watcher 可立即拉回 wav，无需等播放结束
 """
 import json
 import os
@@ -16,12 +18,16 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import wave
 
 API_BASE = os.environ.get("SOVITS_API", "http://127.0.0.1:9880")
 REF_DIR = os.path.expanduser("~/jetson-tts/ref")
 REF_WAV = os.path.join(REF_DIR, "reference.wav")
 REF_TEXT_FILE = os.path.join(REF_DIR, "reference.txt")
 SAMPLE_RATE = 32000  # GPT-SoVITS 输出固定 32kHz
+DUMP_PATH = os.path.expanduser("~/jetson-tts/out.pcm")   # 原始 PCM 缓冲（合成边写）
+OUT_WAV_PATH = os.path.expanduser("~/jetson-tts/out.wav")  # 合成完成即生成的完整 wav
+DONE_PATH = os.path.expanduser("~/jetson-tts/out.done")  # wav 就绪标记，Mac 侧据此即时拉取
 
 SENTENCE_END = "。！？!?…；;"
 SOFT_DELIM = "，,、：:"
@@ -29,10 +35,8 @@ MAX_CHUNK = 120      # 每次请求合并的最大字数（用户验证该配置
 BATCH_SIZE = 8       # 服务端批量并行推理（用户验证音色正常且吞吐高，勿改动）
 RETRY = 3            # 每段失败的重试次数
 FASTEST = 10.0       # 允许的最快语速（字/秒）：低于此值只警告不丢段；真正截断(丢句)才会超过
-PREBUFFER = 3        # 开始播放前预合成的批次数（合成领先越多，越不容易卡顿）
 PAD_MS = 60          # 段间静音垫（毫秒），仅做自然句读停顿
 HTTP_TIMEOUT = 240   # 单段请求超时（秒）：避免 Jetson 内存高压下请求挂起导致假死
-DUMP_PATH = os.path.expanduser("~/jetson-tts/out.pcm")  # 同时在远端落盘，供 Mac 播完后拉取保存
 
 
 def log(msg: str) -> None:
@@ -118,6 +122,23 @@ def synth_one(text: str, ref_wav: str, prompt_text: str):
     return pcm, len(pcm) / 2 / SAMPLE_RATE, req_time
 
 
+def finalize_wav():
+    """把完整 out.pcm 加上 wav 头转成 out.wav，并写 done 标记。"""
+    tmp = OUT_WAV_PATH + ".tmp"
+    with open(DUMP_PATH, "rb") as src, wave.open(tmp, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        while True:
+            buf = src.read(1 << 20)
+            if not buf:
+                break
+            w.writeframes(buf)
+    os.rename(tmp, OUT_WAV_PATH)
+    with open(DONE_PATH, "w") as f:
+        f.write(str(os.path.getsize(OUT_WAV_PATH)))
+
+
 def main() -> None:
     t_start = time.time()
     if not (os.path.exists(REF_WAV) and os.path.exists(REF_TEXT_FILE)):
@@ -128,18 +149,20 @@ def main() -> None:
         log("[error] 参考音频文字为空，请用 --set-ref 重新设置")
         sys.exit(2)
 
-    log(f"[init] 参考音频: {REF_WAV}，分段整段合成流水线（伪流式）")
+    log(f"[init] 参考音频: {REF_WAV}，合成与播放解耦流水线")
 
     text = sys.stdin.buffer.read().decode("utf-8")
     chunks = split_text(text)
     if not chunks:
         log("[error] 文本为空，没有可合成的内容")
         sys.exit(1)
-    log(f"[init] 共 {len(chunks)} 段，总字数 {len(text)}，预合成 {PREBUFFER} 段后开始连续播放")
+    log(f"[init] 共 {len(chunks)} 段，总字数 {len(text)}，推理进度与播放进度分开显示")
 
-    # 双缓冲流水线：合成线程逐段合成入队；单段失败重试后跳过，绝不中断后续段落
-    q: "queue.Queue" = queue.Queue(maxsize=PREBUFFER + 2)
-    compute_holder = {"total": 0.0, "requests": 0}  # 纯推理耗时 = 每次网络请求耗时累加
+    pad = b"\x00\x00" * int(SAMPLE_RATE * PAD_MS / 1000)  # 段间静音垫
+    dump_w = open(DUMP_PATH, "wb")  # 合成线程直写（顺序 = 文本顺序）
+    # 通知队列：只传元数据（段号/字节数），PCM 走磁盘缓冲，内存 O(1)
+    q: "queue.Queue" = queue.Queue()
+    compute_holder = {"total": 0.0, "requests": 0}
 
     def producer():
         for i, ch in enumerate(chunks):
@@ -152,7 +175,6 @@ def main() -> None:
                     compute_holder["requests"] += 1
                     last_pcm, last_dur, last_dt = pcm, dur, dt
                     if dur >= len(ch) / FASTEST:
-                        q.put((i, pcm, dur, dt, ""))
                         break
                     last_err = f"疑似偏快({dur:.1f}s/{len(ch)}字)"
                     log(f"[warn] 第{i+1}段 {last_err}，重试 {attempt+1}/{RETRY}")
@@ -162,75 +184,81 @@ def main() -> None:
                     time.sleep(2)
             else:
                 # 重试耗尽：拿到过音频就照播（偏快只是警告，绝不丢段）；彻底失败才跳过
-                if last_pcm:
-                    q.put((i, last_pcm, last_dur, last_dt, f"[注意] {last_err}"))
-                else:
-                    q.put((i, b"", 0.0, 0.0, f"合成失败，已跳过: {ch[:20]}…"))
+                last_err = f"[注意] {last_err}" if last_pcm else f"合成失败，已跳过: {ch[:20]}…"
+
+            if last_pcm:
+                seg = (pad if i > 0 else b"") + last_pcm
+                dump_w.write(seg)
+                dump_w.flush()
+                q.put((i, len(seg), last_dur, last_dt, last_err))
+                log(f"[推理 {i+1}/{len(chunks)}] {len(ch)}字 耗时{last_dt:.1f}s")
+            else:
+                q.put((i, 0, 0.0, 0.0, last_err))
+                log(f"[推理 {i+1}/{len(chunks)}] 跳过")
+
+        dump_w.flush()
+        dump_w.close()
+        try:
+            finalize_wav()
+            log(f"[synth-ready] 全部合成完成，wav 已生成: {OUT_WAV_PATH} (compute {compute_holder['total']:.1f}s / {compute_holder['requests']}次请求)")
+        except Exception as e:
+            log(f"[warn] wav 转换失败: {e}")
         q.put(None)
 
     threading.Thread(target=producer, daemon=True).start()
 
-    pad = b"\x00\x00" * int(SAMPLE_RATE * PAD_MS / 1000)  # 段间静音垫
-    dump_f = open(DUMP_PATH, "wb")  # 远端落盘同步保存（Mac 播完拉走转 wav）
-
+    dump_r = open(DUMP_PATH, "rb")
+    read_pos = 0
     total_audio = 0.0
-    wrote = False
 
-    def play_item(item):
-        nonlocal total_audio, wrote
-        i, pcm, dur, t_synth, status = item
-        if not pcm:
-            log(f"[skip] 第{i+1}段 {status}")
-            return
-        if wrote:  # 段与段之间的静音垫，让衔接更自然
-            sys.stdout.buffer.write(pad)
-            dump_f.write(pad)
-        sys.stdout.buffer.write(pcm)
-        dump_f.write(pcm)
-        sys.stdout.buffer.flush()
-        dump_f.flush()
-        wrote = True
-        total_audio += dur
-        log(f"[{i+1}/{len(chunks)}] {len(chunks[i])}字 -> 音频{dur:.1f}s (合成耗时{t_synth:.1f}s) {status}")
-
-    # 预缓冲：先等前 PREBUFFER 段合成好，再开始输出（留出抗抖动余量）
-    pending = []
-    for _ in range(min(PREBUFFER, len(chunks))):
-        item = q.get()
-        if item is None:
-            pending = None
-            break
-        pending.append(item)
-    if pending is None:
-        log("[error] 合成线程提前结束")
-        sys.exit(1)
+    def read_seg(nbytes: int) -> bytes:
+        nonlocal read_pos
+        data = b""
+        while len(data) < nbytes:
+            dump_r.seek(read_pos)
+            piece = dump_r.read(nbytes - len(data))
+            if not piece:
+                time.sleep(0.2)  # 合成未写完该段，短暂等待
+                continue
+            read_pos += len(piece)
+            data += piece
+        return data
 
     try:
-        for item in pending:
-            play_item(item)
-
-        while True:
+        for _ in range(len(chunks)):
             item = q.get(timeout=600)  # 长时间无段产出说明服务假死，超时退出不再傻等
             if item is None:
                 break
-            play_item(item)
+            i, seg_len, dur, dt, status = item
+            if seg_len == 0:
+                log(f"[skip] 第{i+1}段 {status}")
+                continue
+            data = read_seg(seg_len)
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+            total_audio += dur
+            log(f"[播放 {i+1}/{len(chunks)}] 段长{seg_len//64}KB -> 音频{dur:.1f}s")
+        # 播放完毕后等待合成线程收尾（生成 out.wav + out.done 标记）
+        while True:
+            item = q.get(timeout=600)
+            if item is None:
+                break
     except queue.Empty:
         log("[error] 服务长时间无响应（600s），已放弃后续段落")
     except BrokenPipeError:
-        # Mac 端主动中断（Ctrl+C 或播放器退出）：不再继续合成
-        log("[info] 输出管道已关闭，停止合成（已合成的音频保留在远端）")
-        dump_f.close()
+        # Mac 端主动中断（Ctrl+C 或播放器退出）
+        log("[info] 输出管道已关闭，停止播放（远端数据与 wav 产物不受影响）")
         sys.exit(0)
 
     wall_time = time.time() - t_start
+    wav_note = "wav 已生成" if os.path.exists(DONE_PATH) else "wav 未生成"
     log(
         f"[done] 音频总时长(播放) {total_audio:.1f}s | "
         f"TTS合成耗时(compute) {compute_holder['total']:.1f}s "
         f"({compute_holder['requests']}次请求) | "
-        f"流程总耗时(wall) {wall_time:.1f}s"
+        f"流程总耗时(wall) {wall_time:.1f}s | {wav_note}"
     )
-    dump_f.flush()
-    dump_f.close()
+    dump_r.close()
     sys.stdout.buffer.flush()
 
 

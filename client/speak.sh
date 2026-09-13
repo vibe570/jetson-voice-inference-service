@@ -224,12 +224,26 @@ if [ -n "$FF_MAJOR" ] && [ "$FF_MAJOR" -ge 9 ]; then
 else
     CH_OPT=(-ac 1)
 fi
-# 远端 stderr（进度）直接透传到终端，PCM 最简管道进 ffplay 实时播放（无 tee，避免缓冲干扰）
+# 远端 stderr（进度）直接透传到终端，PCM 最简管道进播放器实时播放
 OUT_DIR="$(pwd)/voice"
 mkdir -p "$OUT_DIR"
 OUT_WAV="$OUT_DIR/$(date +%Y%m%d-%H%M%S)-$$.wav"
 OUT_PCM="${OUT_WAV%.wav}.pcm"
 echo ">> 录音将保存到: $OUT_WAV"
+
+# 后台 watcher：远端推理一完成（out.done 出现）就立刻拉回 wav，不用等播放结束
+run_ssh "rm -f ~/jetson-tts/out.done ~/jetson-tts/out.wav ~/jetson-tts/out.pcm" || true
+(
+    for _ in $(seq 1 1080); do   # 每 10s 检查一次，最多 3 小时
+        ssh -n "${SSH_OPTS[@]}" "$HOST" 'test -f ~/jetson-tts/out.done' 2>/dev/null && break
+        sleep 10
+    done
+    if scp "${SSH_OPTS[@]}" "$HOST:jetson-tts/out.wav" "$OUT_WAV" </dev/null 2>/dev/null; then
+        echo ">> 音频已生成并保存（推理完成即回传）: $OUT_WAV"
+    fi
+) &
+WATCH_PID=$!
+
 # 播放器：优先 sounddevice 回调播放器（按到达顺序播，不丢开头）；缺失时回退 ffplay
 PLAYER_PY="$SRC_DIR/.venv/bin/python"
 if [ -x "$PLAYER_PY" ] && [ -f "$SRC_DIR/client/speak_player.py" ]; then
@@ -243,12 +257,16 @@ else
         -f s16le -ar "$SAMPLE_RATE" "${CH_OPT[@]}" -i pipe:0
 fi
 
-# 播放与保存解耦：Jetson 侧已同步落盘 out.pcm，播完拉回转 wav（远端用相对路径，base 是用户 home）
-scp "${SSH_OPTS[@]}" "$HOST:jetson-tts/out.pcm" "$OUT_PCM" </dev/null 2>/dev/null || true
-run_ssh "rm -f ~/jetson-tts/out.pcm" || true
-SAVED_WAV="$OUT_WAV"
-cleanup
-OUT_PCM=""
-OUT_WAV=""
-echo ">> 播放结束，音频已保存: $SAVED_WAV"
-[ -f "$SAVED_WAV" ] || echo ">> 提示: 本地未能生成 wav（远端临时文件拉取失败），但不影响本次播放"
+wait "$WATCH_PID" 2>/dev/null || true
+
+# 收尾：正常完成时 wav 已由 watcher 拉回；中断时用远端 PCM 兜底转 wav
+if [ ! -f "$OUT_WAV" ]; then
+    scp "${SSH_OPTS[@]}" "$HOST:jetson-tts/out.pcm" "$OUT_PCM" </dev/null 2>/dev/null || true
+    cleanup
+fi
+run_ssh "rm -f ~/jetson-tts/out.done ~/jetson-tts/out.wav ~/jetson-tts/out.pcm" || true
+if [ -f "$OUT_WAV" ]; then
+    echo ">> 播放结束，音频已保存: $OUT_WAV"
+else
+    echo ">> 播放结束（本次未保存完整音频）"
+fi
