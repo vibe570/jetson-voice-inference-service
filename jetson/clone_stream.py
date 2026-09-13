@@ -31,8 +31,8 @@ DONE_PATH = os.path.expanduser("~/jetson-tts/out.done")  # wav 就绪标记，Ma
 
 SENTENCE_END = "。！？!?…；;"
 SOFT_DELIM = "，,、：:"
-MAX_CHUNK = 120      # 每次请求合并的最大字数（用户验证该配置音色正常，勿改动）
-BATCH_SIZE = 8       # 服务端批量并行推理（用户验证音色正常且吞吐高，勿改动）
+MAX_CHUNK = int(os.environ.get("SOVITS_CHUNK", "120"))  # 每次请求合并的最大字数（可用环境变量覆盖做实验）
+BATCH_SIZE = int(os.environ.get("SOVITS_BATCH", "8"))   # 服务端批量并行推理（可用环境变量覆盖做实验）
 RETRY = 3            # 每段失败的重试次数
 FASTEST = 10.0       # 允许的最快语速（字/秒）：低于此值只警告不丢段；真正截断(丢句)才会超过
 PAD_MS = 60          # 段间静音垫（毫秒），仅做自然句读停顿
